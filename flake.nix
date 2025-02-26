@@ -12,17 +12,15 @@
     flake-utils,
     ...
   }: let
-    headscaleVersion =
-      if (self ? shortRev)
-      then self.shortRev
-      else "dev";
+    headscaleVersion = self.shortRev or self.dirtyShortRev;
+    commitHash = self.rev or self.dirtyRev;
   in
     {
       overlay = _: prev: let
         pkgs = nixpkgs.legacyPackages.${prev.system};
-        buildGo = pkgs.buildGo123Module;
+        buildGo = pkgs.buildGo124Module;
       in {
-        headscale = buildGo rec {
+        headscale = buildGo {
           pname = "headscale";
           version = headscaleVersion;
           src = pkgs.lib.cleanSource self;
@@ -32,11 +30,16 @@
 
           # When updating go.mod or go.sum, a new sha will need to be calculated,
           # update this if you have a mismatch after doing a change to those files.
-          vendorHash = "sha256-SBfeixT8DQOrK2SWmHHSOBtzRdSZs+pwomHpw6Jd+qc=";
+          vendorHash = "sha256-CoxqEAxGdefyiIhz84LXXxPrZ1JWsX8Ernv1USr9JTs=";
 
           subPackages = ["cmd/headscale"];
 
-          ldflags = ["-s" "-w" "-X github.com/juanfont/headscale/cmd/headscale/cli.Version=v${version}"];
+          ldflags = [
+            "-s"
+            "-w"
+            "-X github.com/juanfont/headscale/hscontrol/types.Version=${headscaleVersion}"
+            "-X github.com/juanfont/headscale/hscontrol/types.GitCommitHash=${commitHash}"
+          ];
         };
 
         protoc-gen-grpc-gateway = buildGo rec {
@@ -94,6 +97,10 @@
         gofumpt = prev.gofumpt.override {
           buildGoModule = buildGo;
         };
+
+        gopls = prev.gopls.override {
+          buildGoModule = buildGo;
+        };
       };
     }
     // flake-utils.lib.eachDefaultSystem
@@ -102,7 +109,7 @@
         overlays = [self.overlay];
         inherit system;
       };
-      buildDeps = with pkgs; [git go_1_23 gnumake];
+      buildDeps = with pkgs; [git go_1_24 gnumake];
       devDeps = with pkgs;
         buildDeps
         ++ [
@@ -114,6 +121,7 @@
           gotestsum
           gotests
           gofumpt
+          gopls
           ksh
           ko
           yq-go

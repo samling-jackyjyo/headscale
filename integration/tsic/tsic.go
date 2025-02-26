@@ -80,6 +80,7 @@ type TailscaleInContainer struct {
 	withExtraHosts    []string
 	workdir           string
 	netfilter         string
+	extraLoginArgs    []string
 
 	// build options, solely for HEAD
 	buildConfig TailscaleInContainerBuildConfig
@@ -203,6 +204,14 @@ func WithBuildTag(tag string) Option {
 	}
 }
 
+// WithExtraLoginArgs adds additional arguments to the `tailscale up` command
+// as part of the Login function.
+func WithExtraLoginArgs(args []string) Option {
+	return func(tsic *TailscaleInContainer) {
+		tsic.extraLoginArgs = args
+	}
+}
+
 // New returns a new TailscaleInContainer instance.
 func New(
 	pool *dockertest.Pool,
@@ -263,8 +272,8 @@ func New(
 		tailscaleOptions.WorkingDir = tsic.workdir
 	}
 
-	// dockertest isnt very good at handling containers that has already
-	// been created, this is an attempt to make sure this container isnt
+	// dockertest isn't very good at handling containers that has already
+	// been created, this is an attempt to make sure this container isn't
 	// present.
 	err = pool.RemoveContainerByName(hostname)
 	if err != nil {
@@ -436,6 +445,10 @@ func (t *TailscaleInContainer) Login(
 		"--accept-routes=false",
 	}
 
+	if t.extraLoginArgs != nil {
+		command = append(command, t.extraLoginArgs...)
+	}
+
 	if t.withSSH {
 		command = append(command, "--ssh")
 	}
@@ -466,7 +479,7 @@ func (t *TailscaleInContainer) Login(
 // This login mechanism uses web + command line flow for authentication.
 func (t *TailscaleInContainer) LoginWithURL(
 	loginServer string,
-) (*url.URL, error) {
+) (loginURL *url.URL, err error) {
 	command := []string{
 		"tailscale",
 		"up",
@@ -475,20 +488,23 @@ func (t *TailscaleInContainer) LoginWithURL(
 		"--accept-routes=false",
 	}
 
-	_, stderr, err := t.Execute(command)
+	if t.extraLoginArgs != nil {
+		command = append(command, t.extraLoginArgs...)
+	}
+
+	stdout, stderr, err := t.Execute(command)
 	if errors.Is(err, errTailscaleNotLoggedIn) {
 		return nil, errTailscaleCannotUpWithoutAuthkey
 	}
 
-	urlStr := strings.ReplaceAll(stderr, "\nTo authenticate, visit:\n\n\t", "")
-	urlStr = strings.TrimSpace(urlStr)
+	defer func() {
+		if err != nil {
+			log.Printf("join command: %q", strings.Join(command, " "))
+		}
+	}()
 
-	// parse URL
-	loginURL, err := url.Parse(urlStr)
+	loginURL, err = util.ParseLoginURLFromCLILogin(stdout + stderr)
 	if err != nil {
-		log.Printf("Could not parse login URL: %s", err)
-		log.Printf("Original join command result: %s", stderr)
-
 		return nil, err
 	}
 
@@ -497,12 +513,17 @@ func (t *TailscaleInContainer) LoginWithURL(
 
 // Logout runs the logout routine on the given Tailscale instance.
 func (t *TailscaleInContainer) Logout() error {
-	_, _, err := t.Execute([]string{"tailscale", "logout"})
+	stdout, stderr, err := t.Execute([]string{"tailscale", "logout"})
 	if err != nil {
 		return err
 	}
 
-	return nil
+	stdout, stderr, _ = t.Execute([]string{"tailscale", "status"})
+	if !strings.Contains(stdout+stderr, "Logged out.") {
+		return fmt.Errorf("failed to logout, stdout: %s, stderr: %s", stdout, stderr)
+	}
+
+	return t.waitForBackendState("NeedsLogin")
 }
 
 // Helper that runs `tailscale up` with no arguments.
@@ -601,6 +622,16 @@ func (t *TailscaleInContainer) Status(save ...bool) (*ipnstate.Status, error) {
 	}
 
 	return &status, err
+}
+
+// Status returns the ipnstate.Status of the Tailscale instance.
+func (t *TailscaleInContainer) MustStatus() *ipnstate.Status {
+	status, err := t.Status()
+	if err != nil {
+		panic(err)
+	}
+
+	return status
 }
 
 // Netmap returns the current Netmap (netmap.NetworkMap) of the Tailscale instance.
@@ -826,28 +857,16 @@ func (t *TailscaleInContainer) FailingPeersAsString() (string, bool, error) {
 // WaitForNeedsLogin blocks until the Tailscale (tailscaled) instance has
 // started and needs to be logged into.
 func (t *TailscaleInContainer) WaitForNeedsLogin() error {
-	return t.pool.Retry(func() error {
-		status, err := t.Status()
-		if err != nil {
-			return errTailscaleStatus(t.hostname, err)
-		}
-
-		// ipnstate.Status.CurrentTailnet was added in Tailscale 1.22.0
-		// https://github.com/tailscale/tailscale/pull/3865
-		//
-		// Before that, we can check the BackendState to see if the
-		// tailscaled daemon is connected to the control system.
-		if status.BackendState == "NeedsLogin" {
-			return nil
-		}
-
-		return errTailscaledNotReadyForLogin
-	})
+	return t.waitForBackendState("NeedsLogin")
 }
 
 // WaitForRunning blocks until the Tailscale (tailscaled) instance is logged in
 // and ready to be used.
 func (t *TailscaleInContainer) WaitForRunning() error {
+	return t.waitForBackendState("Running")
+}
+
+func (t *TailscaleInContainer) waitForBackendState(state string) error {
 	return t.pool.Retry(func() error {
 		status, err := t.Status()
 		if err != nil {
@@ -859,7 +878,7 @@ func (t *TailscaleInContainer) WaitForRunning() error {
 		//
 		// Before that, we can check the BackendState to see if the
 		// tailscaled daemon is connected to the control system.
-		if status.BackendState == "Running" {
+		if status.BackendState == state {
 			return nil
 		}
 
